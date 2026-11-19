@@ -244,17 +244,10 @@ del gateway.
 
 ## Video de demostración
 
-**Enlace:** _(agregar el enlace del video)_
+**Enlace:** https://youtu.be/KowtH02gA98 (2 min 39 s)
 
-En unos 5 minutos muestra:
-- El servicio Live en Render.
-- `/health` y `/docs`.
-- Una pregunta en la página.
-- Una pregunta con PII que devuelve `redactions`.
-- Un `401` con clave inválida.
-- `/metrics`.
-- La traza en LangSmith.
-- El dashboard de Cloudflare AI Gateway.
+Muestra el sistema activo y funcionando en producción en Render. El plan gratuito apaga el servicio tras un
+periodo de inactividad, así que el video es la evidencia de que está vivo.
 
 ## Notas adicionales
 
