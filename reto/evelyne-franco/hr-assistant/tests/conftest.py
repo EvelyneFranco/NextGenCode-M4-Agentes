@@ -31,53 +31,34 @@ from app.metrics import Metrics
 from app.pricing import PriceTable
 from app.ratelimit import RateLimiter
 
+# Los datos de muestra y los espias del sistema multi-agente viven en
+# modulos auxiliares; se vuelven a exportar aqui para que las pruebas
+# sigan importandolos desde ``tests.conftest``.
+# pylint: disable=unused-import
+from tests.sample_data import (
+    AGENTS_DIRECTORY,
+    AGENTS_POLICY,
+    DIRECTORY_UNVERIFIED,
+    POLICY_TOPICS,
+    POLICY_UNVERIFIED,
+    SAMPLE_EMPLOYEES,
+    SAMPLE_POLICIES,
+    SUPERVISOR_INPUT_TOKENS,
+    SUPERVISOR_OUTPUT_TOKENS,
+    SUPERVISOR_ROUTES_AT_ZERO,
+    VACATION_TEXT,
+)
+from tests.spies import SpyModel, TreeTracer
+
+# pylint: enable=unused-import
+from tests.spies import run_record
+
 
 # -- Datos de prueba -----------------------------------------------
 
-SAMPLE_EMPLOYEES = [
-    {
-        "id": "EMP-0001",
-        "name": "Ana Lopez",
-        "department": "Tecnologia",
-        "role": "Analista de datos",
-        "start_date": "2019-03-04",
-        "status": "activo",
-    },
-    {
-        "id": "EMP-0002",
-        "name": "Luis Perez",
-        "department": "Ventas",
-        "role": "Ejecutivo de cuenta",
-        "start_date": "2021-07-19",
-        "status": "activo",
-    },
-    {
-        "id": "EMP-0003",
-        "name": "Marta Ruiz",
-        "department": "Tecnologia",
-        "role": "Desarrolladora",
-        "start_date": "2016-11-02",
-        "status": "baja",
-    },
-    {
-        "id": "EMP-0004",
-        "name": "Jorge Diaz",
-        "department": "Tecnologia",
-        "role": "Lider tecnico",
-        "start_date": "2022-01-10",
-        "status": "activo",
-    },
-    {
-        "id": "EMP-0005",
-        "name": "Sofia Gomez",
-        "department": "Finanzas",
-        "role": "Contadora",
-        "start_date": "2020-05-25",
-        "status": "activo",
-    },
-]
-
 FIXED_NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+# Adenda 1 de la spec 06: reloj fijo de los escenarios de vacaciones.
+ADENDA_NOW = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
 SLO_P95_MS = 2000
 
 # Sesion 3: nombres por omision de los modelos y copia de
@@ -108,21 +89,27 @@ DEFAULT_RATE_LIMIT = 30
 class FakeClock:
     """Reloj falso y determinista para las pruebas.
 
-    ``now()`` siempre devuelve la misma hora UTC. ``monotonic()``
-    avanza ``tick_seconds`` en cada llamada, de modo que una peticion
-    medida con dos lecturas dura exactamente ``tick_seconds``.
+    ``now()`` siempre devuelve la misma hora UTC (``FIXED_NOW`` o la que
+    se indique en ``now``). ``monotonic()`` avanza ``tick_seconds`` en
+    cada llamada, de modo que una peticion medida con dos lecturas dura
+    exactamente ``tick_seconds``.
 
     :param tick_seconds: Avance de ``monotonic()`` por llamada.
     :type tick_seconds: float
+    :param now: Instante fijo opcional (Adenda 1 de la spec 06).
+    :type now: datetime.datetime | None
     """
 
-    def __init__(self, tick_seconds=0.25):
+    def __init__(self, tick_seconds=0.25, now=None):
         """Inicializa el reloj en el instante fijo.
 
         :param tick_seconds: Avance de ``monotonic()`` por llamada.
         :type tick_seconds: float
+        :param now: Instante fijo opcional; por omision ``FIXED_NOW``.
+        :type now: datetime.datetime | None
         """
         self._tick = tick_seconds
+        self._now = now or FIXED_NOW
         self._mono = 100.0
         # Reto: la prueba de concurrencia lee el reloj desde varios hilos.
         self._lock = threading.Lock()
@@ -133,7 +120,7 @@ class FakeClock:
         :return: Instante fijo con zona horaria UTC.
         :rtype: datetime.datetime
         """
-        return FIXED_NOW
+        return self._now
 
     def monotonic(self):
         """Devuelve el valor actual y avanza un tick.
@@ -373,7 +360,17 @@ class RecordingTracer:
     def __init__(self):
         """Inicializa la lista de spans y su candado."""
         self.spans = []
+        self.annotations = []
         self._lock = threading.Lock()
+
+    def annotate(self, metadata):
+        """Spec 06: guarda los metadatos que se agregan al run actual.
+
+        :param metadata: Metadatos agregados, por ejemplo ``specialist``.
+        :type metadata: dict
+        """
+        with self._lock:
+            self.annotations.append(dict(metadata))
 
     def traceable(self, name, run_type, metadata=None):
         """Crea un decorador que anota cada llamada como un span.
@@ -391,17 +388,10 @@ class RecordingTracer:
         def decorator(func):
             def wrapper(*args, **kwargs):
                 result = func(*args, **kwargs)
+                span = run_record(name, run_type, metadata, args, kwargs)
+                span["result"] = result
                 with self._lock:
-                    self.spans.append(
-                        {
-                            "name": name,
-                            "run_type": run_type,
-                            "metadata": dict(metadata or {}),
-                            "args": args,
-                            "kwargs": kwargs,
-                            "result": result,
-                        }
-                    )
+                    self.spans.append(span)
                 return result
 
             return wrapper
@@ -573,7 +563,36 @@ def prices(prices_file):
 
 
 @pytest.fixture()
-def build_harness(employees_file, prices_file):
+def policies_file(tmp_path):
+    """Spec 06: crea un archivo temporal con ``SAMPLE_POLICIES``.
+
+    :return: Ruta al JSON temporal de politicas.
+    :rtype: pathlib.Path
+    """
+    path = tmp_path / "policies.json"
+    path.write_text(
+        json.dumps(SAMPLE_POLICIES, ensure_ascii=False), encoding="utf-8"
+    )
+    return path
+
+
+@pytest.fixture()
+def policy_book(policies_file):
+    """Spec 06: politicas cargadas con ``PolicyBook.from_file``.
+
+    :param policies_file: Ruta al JSON temporal de politicas.
+    :type policies_file: pathlib.Path
+    :return: Libro de politicas.
+    :rtype: app.policies.PolicyBook
+    """
+    # Importacion perezosa: el modulo es nuevo en la spec 06.
+    from app.policies import PolicyBook  # pylint: disable=import-outside-toplevel
+
+    return PolicyBook.from_file(str(policies_file))
+
+
+@pytest.fixture()
+def build_harness(employees_file, prices_file, policies_file):
     """Fabrica de aplicaciones de prueba con dependencias inyectadas.
 
     Inyecta un modelo por cada nombre (``MODEL_SMALL`` y
@@ -585,6 +604,8 @@ def build_harness(employees_file, prices_file):
     :type employees_file: pathlib.Path
     :param prices_file: Ruta al JSON temporal de precios.
     :type prices_file: pathlib.Path
+    :param policies_file: Ruta al JSON temporal de politicas (spec 06).
+    :type policies_file: pathlib.Path
     :return: Funcion que construye un ``Harness``.
     :rtype: callable
     """
@@ -596,6 +617,7 @@ def build_harness(employees_file, prices_file):
         model_factory=None,
         rate_limit=DEFAULT_RATE_LIMIT,
         tracer=None,
+        now=None,
         **overrides,
     ):
         # Reto: las claves de prueba tambien van en ``settings`` para que
@@ -620,9 +642,13 @@ def build_harness(employees_file, prices_file):
                 name: factory(name)
                 for name in (settings.model_small, settings.model_large)
             }
-        clock = FakeClock(tick_seconds)
+        # Adenda 1: ``now`` fija la fecha que ve ``vacation_days``.
+        clock = FakeClock(tick_seconds, now=now)
         stream = io.StringIO()
         metrics = Metrics(slo_p95_ms=SLO_P95_MS)
+        # Spec 06: las politicas de prueba se inyectan como el directorio.
+        from app.policies import PolicyBook  # pylint: disable=import-outside-toplevel
+
         application = create_app(
             settings=settings,
             models=models,
@@ -638,6 +664,7 @@ def build_harness(employees_file, prices_file):
             auth=ApiKeyAuth(parse_api_keys(TEST_API_KEYS)),
             rate_limiter=RateLimiter(rate_limit, clock),
             tracer=tracer,
+            policies=PolicyBook.from_file(str(policies_file)),
         )
         client = TestClient(
             application,

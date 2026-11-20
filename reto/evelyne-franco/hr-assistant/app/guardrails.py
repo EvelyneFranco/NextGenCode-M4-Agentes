@@ -8,7 +8,11 @@
 - ``validate_answer``: valida la respuesta final del agente (secretos,
   PII, vacia y largo maximo, en ese orden).
 - ``validate_tool_args``: minimo privilegio para los argumentos que pide
-  el modelo.
+  el modelo (desde la spec 06 tambien ``search_policy`` y, desde su
+  Adenda 1, ``vacation_days``).
+- ``screen_answer`` y ``truncate_answer``: las dos mitades de
+  ``validate_answer``, para que el revisor compruebe contra los datos
+  entre ambas.
 
 Ninguna funcion escribe en el log ni devuelve el valor detectado en un
 motivo de rechazo.
@@ -18,12 +22,12 @@ motivo de rechazo.
 
 from __future__ import annotations
 
-import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.employee_ids import EMPLOYEE_ID_PATTERN
 from app.pii import merge_kinds, redact_pii
 from app.text import fold_text
 
@@ -56,9 +60,11 @@ INJECTION_PHRASES = (
 )
 TOOL_GET_EMPLOYEE = "get_employee"
 TOOL_SEARCH_BY_DEPARTMENT = "search_by_department"
-EMPLOYEE_ID_PATTERN = re.compile(r"EMP-\d{4}")
+TOOL_SEARCH_POLICY = "search_policy"
+TOOL_VACATION_DAYS = "vacation_days"
 EMPLOYEE_ID_PREFIX = "emp-"
 MAX_NAME_CHARS = 80
+MAX_TOPIC_CHARS = 60
 
 
 @dataclass(frozen=True)
@@ -133,6 +139,9 @@ def validate_answer(
     Orden: secretos, PII, respuesta vacia y recorte. Los secretos van
     antes que la PII para que una clave con 10 digitos no salga como
     telefono, y antes del recorte para no dejar parte de una clave.
+    Desde la spec 06 es la composicion de ``screen_answer`` y
+    ``truncate_answer``; el revisor mete la comprobacion contra los
+    datos entre las dos.
 
     :param text: Respuesta del agente.
     :type text: str
@@ -141,6 +150,25 @@ def validate_answer(
     :param max_chars: Largo maximo (``MAX_ANSWER_CHARS``).
     :type max_chars: int
     :return: Respuesta valida, tipos ocultados y hallazgos.
+    :rtype: AnswerCheck
+    """
+    screened = screen_answer(text, secrets)
+    trimmed, trim_findings = truncate_answer(screened.text, max_chars)
+    return AnswerCheck(
+        text=trimmed,
+        kinds=list(screened.kinds),
+        findings=[*screened.findings, *trim_findings],
+    )
+
+
+def screen_answer(text: str, secrets: Iterable[str]) -> AnswerCheck:
+    """Primera parte de la validacion: secretos, PII y respuesta vacia.
+
+    :param text: Respuesta del agente.
+    :type text: str
+    :param secrets: Claves de ``API_KEYS`` y ``CF_API_TOKEN``.
+    :type secrets: collections.abc.Iterable[str]
+    :return: Respuesta limpia (sin recortar), tipos ocultados y hallazgos.
     :rtype: AnswerCheck
     """
     findings: list[tuple[str, list[str]]] = []
@@ -157,10 +185,25 @@ def validate_answer(
     if not cleaned.strip():
         cleaned = SAFE_FALLBACK_ANSWER
         findings.append((CONTROL_OUTPUT_INVALID, [KIND_EMPTY]))
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[:max_chars]
-        findings.append((CONTROL_OUTPUT_INVALID, [KIND_TOO_LONG]))
     return AnswerCheck(text=cleaned, kinds=kinds, findings=findings)
+
+
+def truncate_answer(
+    text: str, max_chars: int
+) -> tuple[str, list[tuple[str, list[str]]]]:
+    """Ultima parte de la validacion: recorta a ``max_chars``.
+
+    :param text: Respuesta ya revisada.
+    :type text: str
+    :param max_chars: Largo maximo (``MAX_ANSWER_CHARS``).
+    :type max_chars: int
+    :return: Respuesta recortada y hallazgos (``output_invalid`` con
+        ``too_long`` si se recorto).
+    :rtype: tuple[str, list[tuple[str, list[str]]]]
+    """
+    if len(text) > max_chars:
+        return text[:max_chars], [(CONTROL_OUTPUT_INVALID, [KIND_TOO_LONG])]
+    return text, []
 
 
 def _has_control_chars(text: str) -> bool:
@@ -240,4 +283,43 @@ def validate_tool_args(
         return _employee_reason(args.get("employee_id"))
     if tool == TOOL_SEARCH_BY_DEPARTMENT:
         return _department_reason(args.get("department"), departments)
+    if tool == TOOL_SEARCH_POLICY:
+        return _topic_reason(args.get("topic"))
+    if tool == TOOL_VACATION_DAYS:
+        return _vacation_reason(args.get("employee_id"))
     return "herramienta desconocida"
+
+
+def _vacation_reason(value: Any) -> str | None:
+    """Valida el argumento ``employee_id`` de ``vacation_days`` (Adenda 1).
+
+    Solo acepta un id ``EMP-dddd`` exacto, sin nombres.
+
+    :param value: Valor pedido por el modelo.
+    :type value: Any
+    :return: Motivo del rechazo o ``None`` si es valido.
+    :rtype: str | None
+    """
+    if isinstance(value, str) and EMPLOYEE_ID_PATTERN.fullmatch(value.strip()):
+        return None
+    return "vacation_days acepta solo un id EMP-####"
+
+
+def _topic_reason(value: Any) -> str | None:
+    """Valida el argumento ``topic`` de ``search_policy`` (spec 06).
+
+    Acepta un texto de 1 a 60 caracteres sin caracteres de control.
+
+    :param value: Valor pedido por el modelo.
+    :type value: Any
+    :return: Motivo del rechazo o ``None`` si es valido.
+    :rtype: str | None
+    """
+    reason = f"search_policy acepta un tema de 1 a {MAX_TOPIC_CHARS} caracteres"
+    if not isinstance(value, str):
+        return reason
+    if not value.strip() or len(value) > MAX_TOPIC_CHARS:
+        return reason
+    if _has_control_chars(value):
+        return reason
+    return None

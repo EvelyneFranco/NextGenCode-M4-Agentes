@@ -95,6 +95,8 @@ class Settings(BaseModel, frozen=True):
     :param max_answer_chars: Largo maximo de la respuesta (reto de
         seguridad reforzada).
     :type max_answer_chars: int
+    :param policies_path: Ruta a las politicas de RH (spec 06).
+    :type policies_path: str
     """
 
     model_provider: str = "fake"
@@ -122,6 +124,9 @@ class Settings(BaseModel, frozen=True):
     api_keys: tuple[ApiKey, ...] = ()
     rate_limit_per_minute: int = 30
     max_answer_chars: int = 2000
+    # Spec 06: no es configuracion nueva (no hay variable de entorno); es
+    # la ruta fija de las politicas, como la de los empleados.
+    policies_path: str = "data/policies.json"
 
     def secret_values(self) -> tuple[str, ...]:
         """Devuelve los secretos que nunca deben salir en una respuesta.

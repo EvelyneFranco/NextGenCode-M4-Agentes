@@ -19,8 +19,9 @@ from typing import Any
 
 import httpx
 
-from app.completion import TOOL_RESULT_PREFIX, Completion, Model, ModelUnavailable
+from app.completion import Completion, Model, ModelUnavailable
 from app.config import Settings
+from app.prompts import DIRECTORY_PROMPT
 
 GATEWAY_URL = (
     "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}"
@@ -31,19 +32,10 @@ CACHE_TTL_HEADER = "cf-aig-cache-ttl"
 CACHE_STATUS_HEADER = "cf-aig-cache-status"
 CACHE_HIT = "HIT"
 FIRST_ERROR_STATUS = 400
-SYSTEM_PROMPT = (
-    "Eres el asistente de Recursos Humanos. Responde SOLO con un objeto JSON, "
-    "sin texto adicional.\n"
-    'Para consultar datos pide una herramienta: {"tool": "<nombre>", '
-    '"args": {...}}.\n'
-    "Herramientas:\n"
-    '- get_employee, args {"employee_id": "EMP-0001"}: datos de un empleado.\n'
-    '- search_by_department, args {"department": "Ventas"}: empleados de un '
-    "departamento.\n"
-    f"El resultado llega en un mensaje que empieza con '{TOOL_RESULT_PREFIX}'.\n"
-    'Para responder usa {"answer": "<respuesta en espanol>"}. Usa solo los '
-    "datos de las herramientas; si no sabes, dilo."
-)
+# Spec 06: el prompt de siempre vive en ``app.prompts``; se conserva el
+# nombre para quien lo importe desde aqui.
+SYSTEM_PROMPT = DIRECTORY_PROMPT
+SYSTEM_ROLE = "system"
 
 
 class GatewayModel(Model):
@@ -85,8 +77,8 @@ class GatewayModel(Model):
     def complete(self, messages: list[dict[str, str]]) -> Completion:
         """Llama al gateway y devuelve el texto y los tokens.
 
-        :param messages: Mensajes de la conversacion (sin prompt de
-            sistema: se agrega aqui).
+        :param messages: Mensajes de la conversacion; si no traen un
+            prompt de sistema, se agrega aqui el de ``directory``.
         :type messages: list[dict[str, str]]
         :return: Texto del modelo, tokens y si vino de la cache.
         :rtype: app.completion.Completion
@@ -120,14 +112,22 @@ class GatewayModel(Model):
     def _body(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         """Arma el cuerpo ``{model, messages, max_tokens, temperature}``.
 
+        Spec 06: si los mensajes ya traen un ``system`` (supervisor o
+        especialista ``policy``), se respeta; si no, se antepone el
+        prompt del especialista ``directory``, como siempre.
+
         :param messages: Mensajes de la conversacion.
         :type messages: list[dict[str, str]]
         :return: Cuerpo JSON de la llamada.
         :rtype: dict[str, Any]
         """
+        if messages and messages[0].get("role") == SYSTEM_ROLE:
+            full = list(messages)
+        else:
+            full = [{"role": SYSTEM_ROLE, "content": SYSTEM_PROMPT}, *messages]
         return {
             "model": self.name,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+            "messages": full,
             "max_tokens": self._settings.model_max_tokens,
             "temperature": self._settings.model_temperature,
         }

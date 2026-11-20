@@ -63,6 +63,28 @@ class Directory:
             {e["department"] for e in self._employees}
         )
 
+    @property
+    def ids(self) -> list[str]:
+        """Ids de todos los empleados; los usa el revisor (spec 06).
+
+        :return: Ids en el orden del archivo.
+        :rtype: list[str]
+        """
+        return [str(e["id"]) for e in self._employees]
+
+    def find(self, employee_id: str) -> dict[str, Any] | None:
+        """Busca un empleado por id exacto (Adenda 1, ``vacation_days``).
+
+        :param employee_id: Id ``EMP-dddd``.
+        :type employee_id: str
+        :return: Copia de los datos del empleado o ``None``.
+        :rtype: dict[str, Any] | None
+        """
+        for emp in self._employees:
+            if emp.get("id") == employee_id:
+                return dict(emp)
+        return None
+
     def get_employee(
         self, employee_id: str
     ) -> dict[str, Any] | str:

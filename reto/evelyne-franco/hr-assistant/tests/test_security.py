@@ -162,7 +162,8 @@ def test_security_metrics_start_at_zero_and_keep_the_previous_keys():
     assert snapshot["security"]["injection"] == 1
     previous = {"pid", "requests", "error_rate", "latency_ms", "tokens",
                 "cost_usd", "slo"}
-    assert set(snapshot) == previous | {"security"}
+    # Spec 06, punto 7: tambien se agregan ``specialists`` y ``supervisor``.
+    assert set(snapshot) == previous | {"security", "specialists", "supervisor"}
 
 
 # -- Configuracion --------------------------------------------------
@@ -233,7 +234,14 @@ def test_ask_response_only_adds_an_empty_redactions_list(client):
     response = client.post("/ask", json={"question": "¿Quién es EMP-0001?"})
     body = response.json()
     assert response.status_code == 200
-    assert set(body) == set(ASK_FIELDS) | {"request_id", "redactions"}
+    # Spec 06: se agregan ``specialist``, ``agents`` y ``supervisor_route``.
+    assert set(body) == set(ASK_FIELDS) | {
+        "request_id",
+        "redactions",
+        "specialist",
+        "agents",
+        "supervisor_route",
+    }
     assert body["redactions"] == []
 
 

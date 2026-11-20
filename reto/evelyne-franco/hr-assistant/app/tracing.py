@@ -142,6 +142,26 @@ class Tracer:
             name=name, run_type=run_type, metadata=dict(metadata or {})
         )
 
+    def annotate(self, metadata: dict[str, Any]) -> None:
+        """Agrega metadatos al run abierto mas reciente (spec 06).
+
+        Sirve para el run raiz ``request``: abre antes de que el
+        supervisor decida, y despues se le agregan ``specialist`` y
+        ``supervisor_route``. Con las trazas apagadas no hace nada ni
+        importa ``langsmith``. Nunca debe recibir texto ni la clave.
+
+        :param metadata: Metadatos a agregar, por ejemplo
+            ``{"specialist": "policy"}``.
+        :type metadata: dict[str, Any]
+        """
+        if not self.enabled:
+            return
+        # Importacion perezosa: solo con trazas encendidas.
+        run_helpers = importlib.import_module("langsmith.run_helpers")
+        run_tree = run_helpers.get_current_run_tree()
+        if run_tree is not None:
+            run_tree.add_metadata(dict(metadata))
+
 
 def tracer_from_environ(environ: MutableMapping[str, str] | None = None) -> Tracer:
     """Construye un trazador leyendo la configuracion con ``load_settings``.

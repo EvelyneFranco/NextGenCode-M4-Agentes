@@ -19,13 +19,19 @@ contesta ``502 {"detail": "model unavailable", "request_id": ...}``.
 
 Desde el reto de seguridad reforzada, antes de enrutar se audita la
 inyeccion de instrucciones y se oculta la PII de la pregunta y del
-historial (``_screen_input``); el agente valida la salida. La respuesta
-agrega ``redactions`` (tipos ocultados, sin repetir) y ``/metrics`` la
-llave ``security``.
+historial; despues se valida la salida. La respuesta agrega
+``redactions`` (tipos ocultados, sin repetir) y ``/metrics`` la llave
+``security``.
+
+Desde la spec 06 cada pregunta pasa por ``app.orchestrator``: ``guard``,
+``supervisor``, un especialista (``directory`` o ``policy``) y
+``reviewer``. La respuesta agrega ``specialist``, ``agents`` y
+``supervisor_route``; ``/metrics`` agrega ``specialists`` y
+``supervisor``.
 
 :seealso: ADR 0001 sobre la API sin estado,
-    ``spec/02-observability.md``, ``spec/03-costs.md`` y
-    ``spec/05-security-hardening.md``.
+    ``spec/02-observability.md``, ``spec/03-costs.md``,
+    ``spec/05-security-hardening.md`` y ``spec/06-multiagente.md``.
 """
 
 from __future__ import annotations
@@ -39,19 +45,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from app.agent import Agent
 from app.auth import ApiKeyAuth
 from app.clock import Clock, SystemClock
 from app.compliance import enforce
 from app.completion import Model, ModelUnavailable
 from app.config import Settings, load_settings
 from app.directory import Directory
-from app.guardrails import (
-    CONTROL_INJECTION,
-    CONTROL_PII,
-    KIND_PHRASE,
-    detect_injection,
-)
 from app.llm import build_models
 from app.logs import JsonLogger
 from app.metrics import Metrics
@@ -61,11 +60,12 @@ from app.middleware import (
     request_id_of,
     started_of,
 )
-from app.pii import merge_kinds, redact_pii
+from app.orchestrator import RequestPipeline
+from app.pii import merge_kinds
+from app.policies import PolicyBook
 from app.pricing import PriceTable
 from app.ratelimit import RateLimiter
-from app.routing import route_question, window_history
-from app.security import STAGE_INPUT, Audit, SecurityAudit
+from app.security import SecurityAudit
 from app.tracing import Tracer, TracingOptions
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -73,6 +73,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 SESSION_1_FIELDS = ("answer", "steps", "tools_used", "input_tokens", "output_tokens")
 COST_FIELDS = ("model", "route", "cached_calls", "cost_usd")
 ASK_FIELDS = SESSION_1_FIELDS + COST_FIELDS
+# Spec 06: campos nuevos de POST /ask (no cambian los anteriores).
+AGENT_FIELDS = ("specialist", "agents", "supervisor_route")
 MODEL_UNAVAILABLE_STATUS = 502
 MODEL_UNAVAILABLE_DETAIL = "model unavailable"
 API_KEY_HEADER = "X-API-Key"
@@ -161,6 +163,7 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
     tracer: Tracer | None = None,
     auth: ApiKeyAuth | None = None,
     rate_limiter: RateLimiter | None = None,
+    policies: PolicyBook | None = None,
 ) -> FastAPI:
     """Crea la aplicacion FastAPI con dependencias inyectadas.
 
@@ -195,6 +198,9 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
     :param rate_limiter: Limite por cliente; por omision
         ``settings.rate_limit_per_minute`` con el reloj inyectado.
     :type rate_limiter: app.ratelimit.RateLimiter | None
+    :param policies: Politicas de RH (spec 06); por omision se cargan de
+        ``settings.policies_path``.
+    :type policies: app.policies.PolicyBook | None
     :return: Instancia configurada de la aplicacion.
     :rtype: fastapi.FastAPI
     :raises app.compliance.ComplianceError: Si es produccion y alguna
@@ -204,7 +210,8 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
     settings = settings if settings is not None else Settings()
     enforce(settings)
     directory = directory or Directory(settings.employees_path)
-    models = models or build_models(settings, directory)
+    policies = policies or PolicyBook.from_file(settings.policies_path)
+    models = models or build_models(settings, directory, policies=policies)
     _require_models(models, settings)
     prices = prices or PriceTable.from_file(
         settings.prices_path, (settings.model_small, settings.model_large)
@@ -221,16 +228,18 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
         )
     )
     tracer = tracer or Tracer(TracingOptions.from_settings(settings))
-    agent = Agent(
+    pipeline = RequestPipeline(
+        settings=settings,
+        models=models,
         directory=directory,
+        policies=policies,
         prices=prices,
-        max_steps=settings.agent_max_steps,
         logger=logger,
         tracer=tracer,
-        # La misma auditoria sirve para la entrada (``ask``) y la salida.
+        # La misma auditoria sirve para la entrada (``guard``) y la salida.
         audit=SecurityAudit(logger, metrics, tracer),
-        secrets=settings.secret_values(),
-        max_answer_chars=settings.max_answer_chars,
+        # Adenda 1: ``vacation_days`` usa el mismo reloj inyectado.
+        clock=clock,
     )
 
     application = FastAPI(title="HR Assistant")
@@ -239,6 +248,30 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
     )
     _add_model_error_handler(application, logger)
     _add_open_routes(application)
+    _add_protected_routes(application, guard, settings, metrics, pipeline)
+    return application
+
+
+def _add_protected_routes(
+    application: FastAPI,
+    guard: Any,
+    settings: Settings,
+    metrics: Metrics,
+    pipeline: RequestPipeline,
+) -> None:
+    """Registra las rutas que exigen clave: ``GET /metrics`` y ``POST /ask``.
+
+    :param application: Aplicacion a configurar.
+    :type application: fastapi.FastAPI
+    :param guard: Dependencia ``Depends(ClientGuard(...))``.
+    :type guard: Any
+    :param settings: Configuracion de la aplicacion.
+    :type settings: app.config.Settings
+    :param metrics: Metricas del proceso.
+    :type metrics: app.metrics.Metrics
+    :param pipeline: Orquestador de los agentes (spec 06).
+    :type pipeline: app.orchestrator.RequestPipeline
+    """
 
     @application.get("/metrics")
     def metrics_snapshot(client: str = guard) -> dict[str, Any]:
@@ -246,7 +279,8 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
 
         :param client: Cliente autenticado (lo resuelve ``ClientGuard``).
         :type client: str
-        :return: Peticiones, error, latencia, tokens, costo y SLO.
+        :return: Peticiones, error, latencia, tokens, costo, SLO,
+            ``security``, ``specialists`` y ``supervisor``.
         :rtype: dict[str, Any]
         """
         del client
@@ -265,7 +299,8 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
         :param client: Cliente autenticado (lo resuelve ``ClientGuard``).
         :type client: str
         :return: Respuesta del agente con tokens, modelo, ruta,
-            llamadas cacheadas, costo, ``request_id`` y ``redactions``.
+            llamadas cacheadas, costo, ``request_id``, ``redactions``,
+            ``specialist``, ``agents`` y ``supervisor_route``.
         :rtype: dict[str, Any]
         :raises HTTPException: Si la pregunta es vacia o
             excede el largo maximo (422).
@@ -274,28 +309,18 @@ def create_app(  # pylint: disable=too-many-arguments,too-many-positional-argume
         """
         question = _validate_question(body.question, settings.max_question_chars)
         request_id = request_id_of(request.scope)
-        question, history, input_kinds = _screen_input(
-            question, body.history or [], agent.audit, (request_id, client)
-        )
-        route = route_question(question, settings)
-        result = agent.run(
-            question,
-            window_history(history, settings.history_window),
-            model=models[route.model],
-            request_id=request_id,
-            route=route.reason,
-            client=client,
-        )
+        result = pipeline.run(question, body.history or [], request_id, client)
         metrics.record_tokens(result["input_tokens"], result["output_tokens"])
         metrics.record_cost(result["cost_usd"])
+        metrics.record_agents(result["specialist"], result["supervisor_route"])
         response = {name: result[name] for name in ASK_FIELDS}
         response["request_id"] = request_id
         response["redactions"] = merge_kinds(
-            input_kinds, result.get("output_redactions", [])
+            result["input_redactions"], result["output_redactions"]
         )
+        for name in AGENT_FIELDS:
+            response[name] = result[name]
         return response
-
-    return application
 
 
 def _add_model_error_handler(application: FastAPI, logger: JsonLogger) -> None:
@@ -370,66 +395,6 @@ def _require_models(models: dict[str, Model], settings: Settings) -> None:
     for name in (settings.model_small, settings.model_large):
         if name not in models:
             raise ValueError(f"Falta el modelo configurado: {name}")
-
-
-def _redact_history(
-    history: list[dict[str, str]],
-) -> tuple[list[dict[str, str]], list[str]]:
-    """Oculta la PII de cada valor del historial.
-
-    :param history: Historial recibido.
-    :type history: list[dict[str, str]]
-    :return: Historial limpio y tipos ocultados, sin repetir.
-    :rtype: tuple[list[dict[str, str]], list[str]]
-    """
-    found: list[list[str]] = []
-    clean_history = []
-    for message in history:
-        clean_message = {}
-        for key, value in message.items():
-            result = redact_pii(str(value))
-            found.append(result.kinds)
-            clean_message[key] = result.text
-        clean_history.append(clean_message)
-    return clean_history, merge_kinds(*found)
-
-
-def _screen_input(
-    question: str,
-    history: list[dict[str, str]],
-    audit: Audit,
-    who: tuple[str, str],
-) -> tuple[str, list[dict[str, str]], list[str]]:
-    """Revisa la entrada: detecta inyeccion y oculta la PII.
-
-    La inyeccion solo se audita; la peticion sigue. La PII se oculta en
-    la pregunta y en cada valor del historial completo. Desde aqui solo
-    existe el texto limpio: el enrutador, el modelo, el log y la traza
-    nunca ven el original.
-
-    :param question: Pregunta ya validada.
-    :type question: str
-    :param history: Historial recibido.
-    :type history: list[dict[str, str]]
-    :param audit: Auditoria de seguridad.
-    :type audit: app.security.Audit
-    :param who: ``(request_id, client)`` de la peticion.
-    :type who: tuple[str, str]
-    :return: Pregunta limpia, historial limpio y tipos ocultados.
-    :rtype: tuple[str, list[dict[str, str]], list[str]]
-    """
-    request_id, client = who
-    texts = [question, *(str(m.get("content", "")) for m in history)]
-    if any(detect_injection(text) for text in texts):
-        audit.record(
-            request_id, client, STAGE_INPUT, CONTROL_INJECTION, [KIND_PHRASE]
-        )
-    clean_question = redact_pii(question)
-    clean_history, history_kinds = _redact_history(history)
-    kinds = merge_kinds(clean_question.kinds, history_kinds)
-    if kinds:
-        audit.record(request_id, client, STAGE_INPUT, CONTROL_PII, kinds)
-    return clean_question.text, clean_history, kinds
 
 
 def _validate_question(raw: str, max_chars: int) -> str:

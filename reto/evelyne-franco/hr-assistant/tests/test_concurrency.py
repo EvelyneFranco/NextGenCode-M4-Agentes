@@ -31,7 +31,14 @@ def test_twenty_simultaneous_questions_are_all_answered_and_counted(build_harnes
     def ask(index):
         # Cada hilo usa su propio TestClient sobre la misma aplicacion.
         http = TestClient(harness.app, raise_server_exceptions=False)
-        question = f"Escribe a persona{index}@empresa.com, ¿quién es EMP-0001?"
+        # Spec 06: la mitad va a ``directory`` y la otra mitad a ``policy``.
+        if index < PARALLEL_REQUESTS // 2:
+            question = f"Escribe a persona{index}@empresa.com, ¿quién es EMP-0001?"
+        else:
+            question = (
+                f"Escribe a persona{index}@empresa.com, "
+                "¿cuántos días de vacaciones tengo?"
+            )
         headers = {"X-API-Key": KEYS_BY_CLIENT[clients[index]]}
         barrier.wait()
         return http.post("/ask", json={"question": question}, headers=headers)
@@ -56,6 +63,12 @@ def test_twenty_simultaneous_questions_are_all_answered_and_counted(build_harnes
     assert metrics.status_code == 200
     assert metrics.json()["requests"] == PARALLEL_REQUESTS
     assert metrics.json()["security"]["pii"] == PARALLEL_REQUESTS
+    half = PARALLEL_REQUESTS // 2
+    assert metrics.json()["specialists"] == {"directory": half, "policy": half}
+    assert all(
+        r.json()["specialist"] == ("directory" if i < half else "policy")
+        for i, r in enumerate(responses)
+    )
 
     # 4. tester ya gasto sus 11: la peticion 12 se rechaza.
     question = {"question": "¿Quién es EMP-0001?"}

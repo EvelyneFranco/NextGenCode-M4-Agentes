@@ -136,3 +136,13 @@ def test_hide_inputs_zero_sends_inputs_like_settings():
     assert env["LANGSMITH_HIDE_INPUTS"] == "false"
     assert env["LANGSMITH_HIDE_OUTPUTS"] == "true"
     assert "LANGSMITH_HIDE_INPUTS" not in os.environ
+
+
+def test_annotate_does_not_import_langsmith_when_tracing_is_off(monkeypatch):
+    """Spec 06: con trazas apagadas, ``annotate`` no hace nada ni importa."""
+    monkeypatch.delitem(sys.modules, "langsmith", raising=False)
+    tracer = Tracer(TracingOptions(enabled=False), environ={})
+
+    tracer.annotate({"specialist": "policy", "supervisor_route": "rule:policy"})
+
+    assert "langsmith" not in sys.modules

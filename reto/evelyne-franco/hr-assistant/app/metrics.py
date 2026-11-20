@@ -22,6 +22,17 @@ DEFAULT_WINDOW = 1000
 SERVER_ERROR_STATUS = 500
 # Controles de seguridad: siempre presentes en ``security``, en 0 al inicio.
 SECURITY_CONTROLS = ("pii", "secret", "output_invalid", "tool_args", "injection")
+# Spec 06: especialistas y motivos del supervisor, en 0 al inicio.
+SPECIALISTS = ("directory", "policy")
+SUPERVISOR_ROUTES = (
+    "rule:employee",
+    "rule:department",
+    "rule:policy",
+    # Adenda 1: id de empleado y tema de vacaciones.
+    "rule:policy_employee",
+    "model",
+    "model_invalid",
+)
 
 
 def nearest_rank(values: list[float], percentile: float) -> float:
@@ -66,6 +77,8 @@ class Metrics:  # pylint: disable=too-many-instance-attributes
         self._tokens = {"input": 0, "output": 0}
         self._cost_usd = 0.0
         self._security = dict.fromkeys(SECURITY_CONTROLS, 0)
+        self._specialists = dict.fromkeys(SPECIALISTS, 0)
+        self._supervisor = dict.fromkeys(SUPERVISOR_ROUTES, 0)
         self._lock = threading.Lock()
 
     def record_request(self, latency_ms: float, status: int) -> None:
@@ -115,12 +128,28 @@ class Metrics:  # pylint: disable=too-many-instance-attributes
         with self._lock:
             self._security[control] = self._security.get(control, 0) + 1
 
+    def record_agents(self, specialist: str, route: str) -> None:
+        """Suma una respuesta a su especialista y al motivo del supervisor.
+
+        :param specialist: ``directory`` o ``policy``.
+        :type specialist: str
+        :param route: ``rule:employee``, ``rule:department``,
+            ``rule:policy``, ``rule:policy_employee``, ``model`` o
+            ``model_invalid``.
+        :type route: str
+        """
+        with self._lock:
+            self._specialists[specialist] = self._specialists.get(specialist, 0) + 1
+            self._supervisor[route] = self._supervisor.get(route, 0) + 1
+
     def snapshot(self) -> dict[str, Any]:
         """Devuelve una foto de las metricas actuales.
 
         :return: ``pid``, ``requests``, ``error_rate``,
             ``latency_ms`` (p50 y p95), ``tokens``, ``cost_usd``
-            acumulado, ``slo`` y ``security`` (conteo por control).
+            acumulado, ``slo``, ``security`` (conteo por control),
+            ``specialists`` (conteo por especialista) y ``supervisor``
+            (conteo por motivo del supervisor).
         :rtype: dict[str, Any]
         """
         with self._lock:
@@ -130,6 +159,8 @@ class Metrics:  # pylint: disable=too-many-instance-attributes
             tokens = dict(self._tokens)
             cost_usd = self._cost_usd
             security = dict(self._security)
+            specialists = dict(self._specialists)
+            supervisor = dict(self._supervisor)
         p95 = nearest_rank(latencies, 95)
         return {
             "pid": os.getpid(),
@@ -143,4 +174,6 @@ class Metrics:  # pylint: disable=too-many-instance-attributes
                 "met": p95 < self._slo_p95_ms,
             },
             "security": security,
+            "specialists": specialists,
+            "supervisor": supervisor,
         }

@@ -8,6 +8,7 @@ posicion ``ceil(p / 100 * n)``.
 import os
 
 from app.metrics import Metrics
+from tests.conftest import SUPERVISOR_ROUTES_AT_ZERO
 
 
 def _metrics(slo_p95_ms=2000):
@@ -39,6 +40,9 @@ def test_new_metrics_report_zeros_and_this_process_pid():
             "tool_args": 0,
             "injection": 0,
         },
+        # Spec 06: conteo por especialista y por motivo del supervisor.
+        "specialists": {"directory": 0, "policy": 0},
+        "supervisor": SUPERVISOR_ROUTES_AT_ZERO,
     }
 
 
